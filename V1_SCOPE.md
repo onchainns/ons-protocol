@@ -34,3 +34,11 @@ ONS v1 defines a minimal, neutral naming primitive.
 This document defines the locked scope of ONS v1.
 Clarifications may be added without expanding scope.
 New capabilities will be introduced only in future versions.
+
+### Pricing
+
+- Pricing is category-based and enforced at the protocol level
+- Names may be explicitly classified into pricing tiers
+- Explicit classification always overrides generic pricing rules
+- Certain dictionary, brand-like, or high-signal names may be subject to premium pricing
+- Pricing applies equally to registration and renewal in v1
