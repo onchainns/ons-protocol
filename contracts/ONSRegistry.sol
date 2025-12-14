@@ -1,116 +1,67 @@
 // SPDX-License-Identifier: MIT
 pragma solidity ^0.8.20;
 
-/**
- * ONSRegistry (v1)
- * - Registers .onchain names on-demand
- * - Enforces time-bound registration (annual)
- * - Enforces category-based pricing at protocol level
- * - Forwards payments to a payout address
- *
- * Notes:
- * - This is NOT a resolver. It only handles ownership + expiry.
- * - Names are represented internally; we store by labelhash (keccak256 of normalized label).
- */
 contract ONSRegistry {
-    // ====== Config ======
     uint256 public constant REGISTRATION_PERIOD = 365 days;
 
-    address public owner;          // admin (can set payout + premium list + prices)
-    address public payout;         // where funds go
+    address public owner;
+    address public treasury;
 
-    // Pricing in wei (set these to your desired $ ranges later)
-    uint256 public priceRandom;    // e.g., ~$2-5 in ETH terms (you set this)
-    uint256 public priceWord;      // e.g., ~$10-20
-    uint256 public pricePremium;   // e.g., ~$200-1000+
+    uint256 public priceRandom;   // 5+ chars
+    uint256 public priceWord;     // 4 chars
+    uint256 public pricePremium;  // 3 chars OR manually premium
 
-    // ====== Storage ======
     struct NameRecord {
         address holder;
-        uint64  expires; // unix timestamp
+        uint64 expires;
     }
 
-    // labelhash => record
     mapping(bytes32 => NameRecord) private records;
-
-    // Explicit premium overrides (labelhash => true)
     mapping(bytes32 => bool) public isPremium;
 
-    // Optional explicit “word” overrides (labelhash => true)
-    // (You can start empty. Later you can set curated word list or heuristic rules.)
-    mapping(bytes32 => bool) public isWord;
+    event Registered(string label, bytes32 indexed hash, address indexed holder, uint64 expires, uint256 price);
+    event Renewed(string label, bytes32 indexed hash, uint64 expires, uint256 price);
+    event Transferred(string label, bytes32 indexed hash, address indexed from, address indexed to);
 
-    // ====== Events ======
-    event Registered(string label, bytes32 indexed labelhash, address indexed holder, uint64 expires, uint256 pricePaid);
-    event Renewed(string label, bytes32 indexed labelhash, uint64 expires, uint256 pricePaid);
-    event Transfer(string label, bytes32 indexed labelhash, address indexed from, address indexed to);
-
-    event PayoutUpdated(address indexed payout);
-    event PricesUpdated(uint256 randomPrice, uint256 wordPrice, uint256 premiumPrice);
-    event PremiumSet(bytes32 indexed labelhash, bool isPremium);
-    event WordSet(bytes32 indexed labelhash, bool isWord);
-
-    // ====== Modifiers ======
     modifier onlyOwner() {
-        require(msg.sender == owner, "not owner");
+        require(msg.sender == owner, "NOT_OWNER");
         _;
     }
 
-    constructor(address _payout) {
+    constructor(address _treasury) {
+        require(_treasury != address(0), "BAD_TREASURY");
         owner = msg.sender;
-        payout = _payout;
+        treasury = _treasury;
 
-        // Default placeholder prices (set real values right after deploy)
-        priceRandom  = 0.001 ether;
-        priceWord    = 0.005 ether;
-        pricePremium = 0.05 ether;
+        // Placeholder defaults – update after deploy
+        priceRandom = 0.001 ether;
+        priceWord = 0.01 ether;
+        pricePremium = 0.1 ether;
     }
 
-    // ====== Admin ======
-    function setPayout(address _payout) external onlyOwner {
-        require(_payout != address(0), "bad payout");
-        payout = _payout;
-        emit PayoutUpdated(_payout);
-    }
+    // ---------------- ADMIN ----------------
 
-    function setPrices(uint256 _random, uint256 _word, uint256 _premium) external onlyOwner {
-        require(_random > 0 && _word > 0 && _premium > 0, "bad price");
-        priceRandom = _random;
-        priceWord = _word;
-        pricePremium = _premium;
-        emit PricesUpdated(_random, _word, _premium);
+    function setPrices(uint256 random, uint256 word, uint256 premium) external onlyOwner {
+        priceRandom = random;
+        priceWord = word;
+        pricePremium = premium;
     }
 
     function setPremium(string calldata label, bool value) external onlyOwner {
-        bytes32 h = _labelhash(label);
-        isPremium[h] = value;
-        emit PremiumSet(h, value);
-    }
-
-    function setWord(string calldata label, bool value) external onlyOwner {
-        bytes32 h = _labelhash(label);
-        isWord[h] = value;
-        emit WordSet(h, value);
+        isPremium[_labelhash(label)] = value;
     }
 
     function transferOwnership(address newOwner) external onlyOwner {
-        require(newOwner != address(0), "bad owner");
+        require(newOwner != address(0), "BAD_OWNER");
         owner = newOwner;
     }
 
-    // ====== Public Views ======
-    function labelhashOf(string calldata label) external pure returns (bytes32) {
-        return keccak256(bytes(_normalize(label)));
-    }
+    // ---------------- VIEWS ----------------
 
     function ownerOf(string calldata label) external view returns (address) {
         bytes32 h = _labelhash(label);
         if (_isExpired(h)) return address(0);
         return records[h].holder;
-    }
-
-    function expiresAt(string calldata label) external view returns (uint64) {
-        return records[_labelhash(label)].expires;
     }
 
     function available(string calldata label) external view returns (bool) {
@@ -119,84 +70,72 @@ contract ONSRegistry {
 
     function priceFor(string calldata label) public view returns (uint256) {
         bytes32 h = _labelhash(label);
-        if (isPremium[h]) return pricePremium;
-        if (isWord[h]) return priceWord;
+        uint256 len = bytes(_normalize(label)).length;
 
-        // Default “random” pricing. Later we can add heuristics (length, charset, etc.)
+        if (isPremium[h] || len == 3) return pricePremium;
+        if (len == 4) return priceWord;
         return priceRandom;
     }
 
-    // ====== Core Actions ======
+    // ---------------- CORE ----------------
+
     function register(string calldata label) external payable {
-        bytes32 h = _labelhash(label);
-        require(_validLabel(label), "invalid label");
+        string memory norm = _normalize(label);
+        require(_validLabel(norm), "INVALID_LABEL");
 
-        // must be available
-        require(_isExpired(h), "already registered");
+        bytes32 h = keccak256(bytes(norm));
+        require(_isExpired(h), "TAKEN");
 
-        uint256 price = priceFor(label);
-        require(msg.value >= price, "insufficient payment");
+        uint256 price = priceFor(norm);
+        require(msg.value == price, "EXACT_PAYMENT_REQUIRED");
 
-        uint64 newExpiry = uint64(block.timestamp + REGISTRATION_PERIOD);
-        records[h] = NameRecord({ holder: msg.sender, expires: newExpiry });
+        records[h] = NameRecord({
+            holder: msg.sender,
+            expires: uint64(block.timestamp + REGISTRATION_PERIOD)
+        });
 
-        _forwardFunds();
+        _payTreasury(price);
 
-        // If they overpaid, refund the difference
-        if (msg.value > price) {
-            (bool ok, ) = msg.sender.call{value: msg.value - price}("");
-            require(ok, "refund failed");
-        }
-
-        emit Registered(label, h, msg.sender, newExpiry, price);
+        emit Registered(norm, h, msg.sender, records[h].expires, price);
     }
 
     function renew(string calldata label) external payable {
-        bytes32 h = _labelhash(label);
-        require(_validLabel(label), "invalid label");
+        string memory norm = _normalize(label);
+        bytes32 h = keccak256(bytes(norm));
 
-        // Only current holder can renew (if expired, it must be re-registered)
-        require(!_isExpired(h), "expired");
-        require(records[h].holder == msg.sender, "not holder");
+        require(!_isExpired(h), "EXPIRED");
+        require(records[h].holder == msg.sender, "NOT_HOLDER");
 
-        uint256 price = priceFor(label);
-        require(msg.value >= price, "insufficient payment");
+        uint256 price = priceFor(norm);
+        require(msg.value == price, "EXACT_PAYMENT_REQUIRED");
 
-        uint64 current = records[h].expires;
-        uint64 base = current > block.timestamp ? current : uint64(block.timestamp);
-        uint64 newExpiry = uint64(base + REGISTRATION_PERIOD);
-        records[h].expires = newExpiry;
+        records[h].expires = uint64(
+            (records[h].expires > block.timestamp ? records[h].expires : block.timestamp)
+            + REGISTRATION_PERIOD
+        );
 
-        _forwardFunds();
+        _payTreasury(price);
 
-        if (msg.value > price) {
-            (bool ok, ) = msg.sender.call{value: msg.value - price}("");
-            require(ok, "refund failed");
-        }
-
-        emit Renewed(label, h, newExpiry, price);
+        emit Renewed(norm, h, records[h].expires, price);
     }
 
     function transferName(string calldata label, address to) external {
-        require(to != address(0), "bad to");
+        require(to != address(0), "BAD_TO");
         bytes32 h = _labelhash(label);
-        require(!_isExpired(h), "expired");
-        require(records[h].holder == msg.sender, "not holder");
+        require(records[h].holder == msg.sender, "NOT_HOLDER");
+        require(!_isExpired(h), "EXPIRED");
 
         address from = records[h].holder;
         records[h].holder = to;
 
-        emit Transfer(label, h, from, to);
+        emit Transferred(label, h, from, to);
     }
 
-    // ====== Internals ======
-    function _forwardFunds() internal {
-        // Forward contract balance to payout
-        uint256 bal = address(this).balance;
-        if (bal > 0) {
-            (bool ok, ) = payout.call{value: bal}("");
-            require(ok, "payout failed");
-        }
+    // ---------------- INTERNAL ----------------
+
+    function _payTreasury(uint256 amount) internal {
+        (bool ok,) = treasury.call{value: amount}("");
+        require(ok, "TREASURY_PAY_FAILED");
     }
 
     function _isExpired(bytes32 h) internal view returns (bool) {
@@ -208,44 +147,28 @@ contract ONSRegistry {
     }
 
     function _normalize(string calldata label) internal pure returns (string memory) {
-        // Minimal normalization v1:
-        // - trim not handled
-        // - lowercases A-Z
-        // - no unicode support in v1 (ASCII only)
         bytes memory b = bytes(label);
         bytes memory out = new bytes(b.length);
         for (uint256 i = 0; i < b.length; i++) {
             uint8 c = uint8(b[i]);
-            if (c >= 65 && c <= 90) { // A-Z
-                out[i] = bytes1(c + 32);
-            } else {
-                out[i] = b[i];
-            }
+            out[i] = (c >= 65 && c <= 90) ? bytes1(c + 32) : b[i];
         }
         return string(out);
     }
 
-    function _validLabel(string calldata label) internal pure returns (bool) {
+    function _validLabel(string memory label) internal pure returns (bool) {
         bytes memory b = bytes(label);
-        if (b.length < 1 || b.length > 63) return false; // DNS-style
+        if (b.length < 3 || b.length > 63) return false;
+        if (b[0] == 45 || b[b.length - 1] == 45) return false;
+
         for (uint256 i = 0; i < b.length; i++) {
             uint8 c = uint8(b[i]);
-
-            // allow: a-z, 0-9, hyphen
             bool ok =
-                (c >= 97 && c <= 122) || // a-z
-                (c >= 48 && c <= 57)  || // 0-9
-                (c == 45);               // -
-
-            // also allow uppercase because we normalize (but still reject weird chars)
-            if (!ok) {
-                if (c >= 65 && c <= 90) ok = true;
-            }
-
+                (c >= 97 && c <= 122) ||
+                (c >= 48 && c <= 57) ||
+                (c == 45);
             if (!ok) return false;
         }
-        // no leading/trailing hyphen
-        if (b[0] == "-" || b[b.length - 1] == "-") return false;
         return true;
     }
 
