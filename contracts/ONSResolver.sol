@@ -7,48 +7,44 @@ interface IONSRegistry {
 
 /**
  * ONSResolver (v1)
- * - Stores addresses per chain for a name
- * - Enforces one primary address per chain
- * - Requires ownership from ONSRegistry
+ * - Stores one primary EVM address per chainId for a name
+ * - Stores text records (including "avatar")
+ * - Requires current ownership from ONSRegistry
+ *
+ * Notes:
+ * - For Solana/BTC-style addresses (non-EVM), add bytes-based records in v1.1
  */
 contract ONSResolver {
-    IONSRegistry public registry;
+    IONSRegistry public immutable registry;
 
-    // labelhash => chainId => list of addresses
-    mapping(bytes32 => mapping(uint256 => address[])) private addresses;
-
-    // labelhash => chainId => primary address
+    // labelhash -> chainId -> primary EVM address
     mapping(bytes32 => mapping(uint256 => address)) private primary;
 
-    event AddressAdded(bytes32 indexed labelhash, uint256 indexed chainId, address addr);
+    // labelhash -> key -> value (avatar is key "avatar")
+    mapping(bytes32 => mapping(string => string)) private texts;
+
     event PrimarySet(bytes32 indexed labelhash, uint256 indexed chainId, address addr);
+    event TextSet(bytes32 indexed labelhash, string indexed key, string value);
 
     constructor(address registryAddress) {
+        require(registryAddress != address(0), "BAD_REGISTRY");
         registry = IONSRegistry(registryAddress);
     }
 
     modifier onlyNameOwner(string calldata label) {
-        require(registry.ownerOf(label) == msg.sender, "not name owner");
+        require(registry.ownerOf(label) == msg.sender, "NOT_NAME_OWNER");
         _;
     }
 
-    function addAddress(
-        string calldata label,
-        uint256 chainId,
-        address addr
-    ) external onlyNameOwner(label) {
-        require(addr != address(0), "bad address");
-        bytes32 h = keccak256(bytes(label));
-        addresses[h][chainId].push(addr);
-        emit AddressAdded(h, chainId, addr);
-    }
+    // ---------------- Addresses ----------------
 
     function setPrimary(
         string calldata label,
         uint256 chainId,
         address addr
     ) external onlyNameOwner(label) {
-        bytes32 h = keccak256(bytes(label));
+        require(addr != address(0), "BAD_ADDRESS");
+        bytes32 h = _labelhash(label);
         primary[h][chainId] = addr;
         emit PrimarySet(h, chainId, addr);
     }
@@ -57,13 +53,42 @@ contract ONSResolver {
         string calldata label,
         uint256 chainId
     ) external view returns (address) {
-        return primary[keccak256(bytes(label))][chainId];
+        return primary[_labelhash(label)][chainId];
     }
 
-    function getAll(
+    // ---------------- Text records ----------------
+    // avatar usage: setText(label, "avatar", "<url or nft ref>")
+
+    function setText(
         string calldata label,
-        uint256 chainId
-    ) external view returns (address[] memory) {
-        return addresses[keccak256(bytes(label))][chainId];
+        string calldata key,
+        string calldata value
+    ) external onlyNameOwner(label) {
+        bytes32 h = _labelhash(label);
+        texts[h][key] = value;
+        emit TextSet(h, key, value);
+    }
+
+    function getText(
+        string calldata label,
+        string calldata key
+    ) external view returns (string memory) {
+        return texts[_labelhash(label)][key];
+    }
+
+    // ---------------- Internals ----------------
+
+    function _labelhash(string calldata label) internal pure returns (bytes32) {
+        return keccak256(bytes(_normalize(label)));
+    }
+
+    function _normalize(string calldata label) internal pure returns (string memory) {
+        bytes memory b = bytes(label);
+        bytes memory out = new bytes(b.length);
+        for (uint256 i = 0; i < b.length; i++) {
+            uint8 c = uint8(b[i]);
+            out[i] = (c >= 65 && c <= 90) ? bytes1(c + 32) : b[i];
+        }
+        return string(out);
     }
 }
